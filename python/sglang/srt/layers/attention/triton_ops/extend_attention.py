@@ -28,6 +28,7 @@ from sglang.srt.layers.attention.triton_ops.prefill_attention import (
 )
 
 is_cuda_available = torch.cuda.is_available()
+is_xpu_available = torch.xpu.is_available()
 if is_cuda_available:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
@@ -111,19 +112,19 @@ def _fwd_kernel(
         )
     else:
         # Ragged inputs: Q:[S, H, D]
-        offs_q = cur_seq_extend_start_contiguous * stride_qbs
+        offs_q = cur_seq_extend_start_contiguous * stride_qbs + cur_head * stride_qh
         # the offset to the current seq
         q_block_ptr = tl.make_block_ptr(
             base=Q_Extend + offs_q,
-            shape=(cur_seq_len_extend, q_head_num, Lq),
-            strides=(stride_qbs, stride_qh, 1),
-            offsets=(cur_block_m * BLOCK_M, cur_head, 0),
-            block_shape=(BLOCK_M, 1, BLOCK_DMODEL),
-            order=(2, 1, 0),
+            shape=(cur_seq_len_extend, Lq),
+            strides=(stride_qbs, 1),
+            offsets=(cur_block_m * BLOCK_M, 0),
+            block_shape=(BLOCK_M, BLOCK_DMODEL),
+            order=(1, 0),
         )
         # q:[BLOCK_M, 1, BLOCK_DMODEL]
-        q = tl.load(q_block_ptr, boundary_check=(0, 1, 2))
-        q = tl.reshape(q, (BLOCK_M, BLOCK_DMODEL), can_reorder=False)
+        q = tl.load(q_block_ptr, boundary_check=(0, 1))
+        #q = tl.reshape(q, (BLOCK_M, BLOCK_DMODEL), can_reorder=False)
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
         offs_qpe = (
@@ -200,26 +201,26 @@ def _fwd_kernel(
     # stage 2: compute the trianlge part
     cur_block_m_end = tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     if use_block_ptr:
-        offs_k = cur_seq_extend_start_contiguous * stride_kbs
+        offs_k = cur_seq_extend_start_contiguous * stride_kbs + cur_kv_head * stride_kh
         # the offset to the current seq
         k_block_ptr = tl.make_block_ptr(
             base=K_Extend + offs_k,
-            shape=(cur_seq_len_extend, kv_head_num, Lv),
-            strides=(stride_kbs, stride_kh, 1),
-            offsets=(0, cur_kv_head, 0),
-            block_shape=(BLOCK_N, 1, BLOCK_DMODEL),
-            order=(2, 1, 0),
+            shape=(cur_seq_len_extend, Lv),
+            strides=(stride_kbs, 1),
+            offsets=(0, 0),
+            block_shape=(BLOCK_N, BLOCK_DMODEL),
+            order=(1, 0),
         )
 
-        offs_v = cur_seq_extend_start_contiguous * stride_vbs
+        offs_v = cur_seq_extend_start_contiguous * stride_vbs + cur_kv_head * stride_kh
         # the offset to the current seq
         v_block_ptr = tl.make_block_ptr(
             base=V_Extend + offs_v,
-            shape=(cur_seq_len_extend, kv_head_num, Lv),
-            strides=(stride_vbs, stride_vh, 1),
-            offsets=(0, cur_kv_head, 0),
-            block_shape=(BLOCK_N, 1, BLOCK_DMODEL),
-            order=(2, 1, 0),
+            shape=(cur_seq_len_extend, Lv),
+            strides=(stride_vbs, 1),
+            offsets=(0, 0),
+            block_shape=(BLOCK_N, BLOCK_DMODEL),
+            order=(1, 0),
         )
     for start_n in range(0, cur_block_m_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -238,9 +239,9 @@ def _fwd_kernel(
             )
         else:
             # k:[BLOCK_N, 1, BLOCK_DMODEL]
-            k = tl.load(k_block_ptr, boundary_check=(0, 1, 2))
-            k = k.reshape(BLOCK_N, BLOCK_DMODEL).trans()
-            tl.advance(k_block_ptr, (BLOCK_N, 0, 0))
+            k = tl.load(k_block_ptr, boundary_check=(0, 1))
+            k = k.trans()
+            tl.advance(k_block_ptr, (BLOCK_N, 0))
 
         qk = tl.dot(q, k, out_dtype=tl.float32)
         if BLOCK_DPE > 0:
@@ -283,9 +284,8 @@ def _fwd_kernel(
                 V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
             )
         else:
-            v = tl.load(v_block_ptr, boundary_check=(0, 1, 2))
-            v = v.reshape(BLOCK_N, BLOCK_DMODEL)
-            tl.advance(k_block_ptr, (BLOCK_N, 0, 0))
+            v = tl.load(v_block_ptr, boundary_check=(0, 1))
+            tl.advance(k_block_ptr, (BLOCK_N, 0))
 
         p = p.to(v.dtype)
         acc = acc * re_scale[:, None] + tl.dot(p, v)
@@ -306,21 +306,21 @@ def _fwd_kernel(
         )
     else:
         # Ragged inputs: out:[S, H, D]
-        offs_o = cur_seq_extend_start_contiguous * stride_obs
+        offs_o = cur_seq_extend_start_contiguous * stride_obs + cur_head * stride_oh
         # the offset to the current seq
         o_block_ptr = tl.make_block_ptr(
             base=O_Extend + offs_o,
-            shape=(cur_seq_len_extend, q_head_num, Lq),
-            strides=(stride_obs, stride_oh, 1),
-            offsets=(cur_block_m * BLOCK_M, cur_head, 0),
-            block_shape=(BLOCK_M, 1, BLOCK_DMODEL),
-            order=(2, 1, 0),
+            shape=(cur_seq_len_extend, Lq),
+            strides=(stride_obs, 1),
+            offsets=(cur_block_m * BLOCK_M, 0),
+            block_shape=(BLOCK_M, BLOCK_DMODEL),
+            order=(1, 0),
         )
         #:[BLOCK_M, BLOCK_DMODEL]
         o = acc / deno[:, None]
         o = o.to(q.dtype)
-        o = o.reshape(BLOCK_M, 1, BLOCK_DMODEL)
-        tl.store(o_block_ptr, o, boundary_check=(0, 1, 2))
+        #o = o.reshape(BLOCK_M, 1, BLOCK_DMODEL)
+        tl.store(o_block_ptr, o, boundary_check=(0, 1))
 
 
 def extend_attention_fwd(
@@ -374,13 +374,21 @@ def extend_attention_fwd(
             BLOCK_M, BLOCK_N = (32, 64)
     else:
         BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
+    
+    if is_xpu_available:
+        BLOCK_M, BLOCK_N = (128, 64) 
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = b_seq_len.shape[0], q_extend.shape[1]
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     num_warps = 4 if Lk <= 64 else 8
+    if is_xpu_available:
+        num_warps = 8 if Lq == 64 else 16
     num_stages = 1
+    #print("BLOCK_M", BLOCK_M, "BLOCK_N", BLOCK_N, "BLOCK_DMODEL", BLOCK_DMODEL, "BLOCK_DPE", BLOCK_DPE, "BLOCK_DV", BLOCK_DV)
+    #print("Lq", Lq, "Lv", Lv, "kv_group_num", kv_group_num, "num_warps", num_warps, "num_stages", num_stages)
+    #print(q_extend.shape, k_extend.shape, v_extend.shape, o_extend.shape, k_buffer.shape, v_buffer.shape, req_to_tokens.shape)
     _fwd_kernel[grid](
         q_extend,
         k_extend,
@@ -420,6 +428,8 @@ def extend_attention_fwd(
         Lv=Lv,
         num_warps=num_warps,
         num_stages=num_stages,
+        grf_mode='large',
+        #advanced_path=True
     )
 
 
